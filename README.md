@@ -44,7 +44,7 @@ Requires root, ports 80 and 443 open, and a DNS A record pointing at the server.
 
 ## Which to Pick — Standalone vs Docker
 
-Both modes run the same `xray.sh` script and produce identical configurations. The difference is environment and lifecycle management.
+Both modes run the same `xray.sh` script and produce identical configurations; the difference is environment.
 
 - **Standalone** installs nginx, certbot, and XRAY directly onto the host OS. Suitable for a dedicated VPS.
 
