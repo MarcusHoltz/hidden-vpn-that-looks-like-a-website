@@ -11,18 +11,7 @@ Generate your own website, certificate, and tunnel all your traffic through it. 
 
 ## Quick Start
 
-The xray.sh script will work on a host machine or inside of docker.
-
-
-* * *
-
-### Standalone (Debian / Ubuntu)
-
-```bash
-sudo bash xray.sh
-```
-
-Requires root, ports 80 and 443 open, and a DNS A record pointing at the server.
+The xray.sh script will work inside of docker or on the host machine itself (Docker recommended).
 
 
 * * *
@@ -42,13 +31,24 @@ Open `http://<your-server-ip>:7681` in a browser. Enter the `TTYD_CREDENTIAL` yo
 
 * * *
 
+### Standalone (Debian / Ubuntu)
+
+```bash
+sudo bash xray.sh
+```
+
+Requires root, ports 80 and 443 open, and a DNS A record pointing at the server.
+
+
+* * *
+
 ## Which to Pick — Standalone vs Docker
 
 Both modes run the same `xray.sh` script and produce identical configurations. The difference is environment and lifecycle management.
 
 - **Standalone** installs nginx, certbot, and XRAY directly onto the host OS. Suitable for a dedicated VPS.
 
-- **Docker** wraps everything in a Debian 12 container. [ttyd](https://github.com/tsl0922/ttyd) serves the xray.sh wizard as a browser-accessible terminal on port 7681 — no SSH needed for setup or ongoing management. All state is written to `./data/` on the host, so the container can be recreated, upgraded, or moved to another server without losing configuration, certificates, or client UUIDs.
+- **Docker** wraps everything in a Debian 12 container. [ttyd](https://github.com/tsl0922/ttyd) serves the xray.sh wizard as a browser-accessible terminal on port 7681 — no SSH needed for setup or ongoing management. All data is written to `./data/` on the host, so the container can be recreated, upgraded, or moved to another server without losing configuration, certificates, or client UUIDs.
 
 
 * * *
