@@ -1,0 +1,22 @@
+# Files that should not be sent to the Docker build daemon.
+# Keeps the build context small and prevents secrets from leaking into the image.
+
+# Persistent data written at runtime — never bake this into the image
+data/
+
+# Local environment file may contain credentials
+.env
+
+# Git metadata
+.git/
+.gitignore
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# Documentation and dev files — not needed in the image
+README.md
