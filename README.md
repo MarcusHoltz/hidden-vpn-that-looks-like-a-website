@@ -75,7 +75,7 @@ Client (VLESS+WS+TLS)
       |
    port 443
       |
-   Nginx  ──>  /           decoy generic tech-company website
+   Nginx  ──>  /           generic tech-company website
           ──>  /<ws-path>  XRAY WebSocket proxy endpoint
                     |
                   XRAY
