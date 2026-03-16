@@ -1,6 +1,6 @@
 # XRAY VLESS HTTPS Proxy with Decoy Website
 
-How about a script that runs in a docker container and can give you a full HTTPS tunnel through your own website.
+How about a script that runs in a docker container and can give you a full HTTPS tunnel?
 
 Generate your own website, certificate, and tunnel all your traffic through it. All the DPI can see is the SNI domain - not the path.
 
