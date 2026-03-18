@@ -503,6 +503,7 @@ _ui_box() {
     local title="$1" body="$2"
     local w; w=$(_ui_width)
     {
+    clear
     echo
     _ui_rule "${w}" "="
     printf "${C_BOLD}${C_FG_WHITE}  %s${C_RESET}\n" "${title}"
