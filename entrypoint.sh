@@ -7,11 +7,23 @@
 #   2. Start cron                (certbot auto-renewal nightly)
 #   3. Re-install XRAY binary    (if config exists but binary is gone after
 #                                 container recreation — auto-recovers silently)
-#   4. Re-start nginx + xray     (if xray.sh was already run previously)
-#   5. exec ttyd                 (becomes PID 1; runs xray.sh in the browser)
+#   4. Generate self-signed TLS cert for ttyd (if not already present)
+#   5. Write nginx SSL block for ttyd on TTYD_PORT and reload nginx
+#   6. Re-start nginx + xray     (if xray.sh was already run previously)
+#   7. exec ttyd                 (becomes PID 1; runs xray.sh in the browser)
 #
 # ttyd is exec'd so Docker SIGTERM/SIGINT are delivered directly to it and
 # the container shuts down cleanly.
+#
+# TLS architecture for ttyd:
+#   browser → https://<IP>:TTYD_PORT (nginx, self-signed cert)
+#                   ↓ proxy_pass
+#             http://127.0.0.1:TTYD_INTERNAL_PORT (ttyd, loopback only)
+#
+# ttyd's built-in --ssl flag is not compiled into the static GitHub release
+# binaries (MbedTLS build, no SSL). Using nginx as the TLS terminator is the
+# only reliable approach. ttyd itself must never be exposed on an external
+# port — it binds loopback only.
 # =============================================================================
 set -euo pipefail
 
@@ -19,38 +31,33 @@ STATE_FILE="/etc/xray-setup/state.env"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 
+# Port nginx listens on externally (TLS, user-facing).
+TTYD_PORT="${TTYD_PORT:-7681}"
+# Port ttyd listens on internally (plain HTTP, loopback only, never exposed).
+TTYD_INTERNAL_PORT="7682"
+
+# Self-signed cert for nginx to serve ttyd over HTTPS.
+TTYD_TLS_DIR="/etc/ttyd"
+TTYD_CERT="${TTYD_TLS_DIR}/cert.pem"
+TTYD_KEY="${TTYD_TLS_DIR}/key.pem"
+
 # ---------------------------------------------------------------------------
 # 1. Ensure log directories exist
-#    The volume mount creates /var/log/nginx and /var/log/xray as host dirs,
-#    but the container also needs them to be present before nginx starts.
 # ---------------------------------------------------------------------------
 mkdir -p /var/log/nginx /var/log/xray
 
 # ---------------------------------------------------------------------------
-# 2. Cron — certbot renewal job; must be running before services start
+# 2. Cron — certbot renewal job
 # ---------------------------------------------------------------------------
 echo "[entrypoint] Starting cron..."
 service cron start 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 3. Auto-restore the XRAY binary after container recreation
-#
-# The XRAY binary lives at /usr/local/bin/xray inside the container's
-# writable layer. When a container is recreated (docker compose down && up),
-# that writable layer is discarded — the binary is gone, but the config and
-# state volumes are still mounted and intact.
-#
-# We detect this state (config present, binary absent) and re-run the
-# official XTLS installer to restore just the binary. The installer is
-# idempotent, fast (~5 s), and does not touch the config file.
-# This means all clients, certs, and settings survive container upgrades.
 # ---------------------------------------------------------------------------
 if [[ -f "${STATE_FILE}" && -f "${XRAY_CONF}" && ! -x "${XRAY_BIN}" ]]; then
     echo "[entrypoint] State and config found but XRAY binary is missing."
-    echo "[entrypoint] This happens after 'docker compose down && up' (container recreation)."
-    echo "[entrypoint] Re-installing XRAY binary now — config and clients are preserved..."
-    # Download the release zip directly — the official installer requires
-    # systemd and will fail in a Docker container.
+    echo "[entrypoint] Re-installing XRAY binary — config and clients are preserved..."
     XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
     XRAY_DAT_DIR="/usr/local/share/xray"
     _arch=$(uname -m)
@@ -79,75 +86,136 @@ if [[ -f "${STATE_FILE}" && -f "${XRAY_CONF}" && ! -x "${XRAY_BIN}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Re-start nginx and xray if a previous installation exists
+# 4. Generate self-signed TLS certificate for ttyd (idempotent)
 #
-# This applies to every startup after the initial setup wizard has run.
-# On the very first run (no state file), this block is skipped entirely
-# and the user runs the wizard from the browser terminal.
+# Valid for 10 years. The browser shows a one-time "untrusted cert" warning
+# which the user accepts once. This cert is only for the admin terminal —
+# encryption in transit is the goal, not third-party identity verification.
+# ---------------------------------------------------------------------------
+echo "[entrypoint] Checking ttyd TLS certificate..."
+mkdir -p "${TTYD_TLS_DIR}"
+chmod 700 "${TTYD_TLS_DIR}"
+
+if [[ ! -f "${TTYD_CERT}" || ! -f "${TTYD_KEY}" ]]; then
+    echo "[entrypoint] Generating self-signed cert for ttyd nginx SSL block..."
+    openssl req -x509 \
+        -newkey rsa:2048 \
+        -keyout "${TTYD_KEY}" \
+        -out    "${TTYD_CERT}" \
+        -days   3650 \
+        -nodes \
+        -subj   "/CN=ttyd/O=xray-setup" \
+        2>/dev/null
+    chmod 600 "${TTYD_KEY}" "${TTYD_CERT}"
+    echo "[entrypoint] ttyd TLS cert generated: ${TTYD_CERT}"
+else
+    echo "[entrypoint] ttyd TLS cert exists: ${TTYD_CERT}"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Write nginx SSL server block for ttyd and reload nginx
+#
+# Written to /etc/nginx/conf.d/ which is included by the nginx Docker image.
+# SSL only on TTYD_PORT — no plain HTTP block on this port. A plain HTTP
+# listener on the same port as SSL causes nginx to serve plain HTTP and
+# ignore the SSL block entirely, producing TLS errors in the browser.
+#
+# ttyd itself runs on 127.0.0.1:TTYD_INTERNAL_PORT (plain HTTP, loopback).
+# This block is the only way to reach it externally, and only over HTTPS.
+# ---------------------------------------------------------------------------
+TTYD_NGINX_CONF="/etc/nginx/conf.d/xray-ttyd.conf"
+echo "[entrypoint] Writing nginx SSL block for ttyd on port ${TTYD_PORT}..."
+cat > "${TTYD_NGINX_CONF}" <<NGINXEOF
+# ttyd web terminal — managed by entrypoint.sh. Do not edit by hand.
+# SSL only on port ${TTYD_PORT}. Plain HTTP has no listener on this port.
+server {
+    listen      ${TTYD_PORT} ssl;
+    listen      [::]:${TTYD_PORT} ssl;
+
+    ssl_certificate     ${TTYD_CERT};
+    ssl_certificate_key ${TTYD_KEY};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    location / {
+        proxy_pass         http://127.0.0.1:${TTYD_INTERNAL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    \$http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+NGINXEOF
+echo "[entrypoint] nginx ttyd SSL block written: ${TTYD_NGINX_CONF}"
+
+# ---------------------------------------------------------------------------
+# 6. Re-start nginx and xray if a previous installation exists
 # ---------------------------------------------------------------------------
 if [[ -f "${STATE_FILE}" ]]; then
     echo "[entrypoint] Existing installation found — starting services..."
 
-    # Test nginx config before starting (xray.sh wrote it; it should be valid)
     if nginx -t 2>/dev/null; then
         nginx
-        echo "[entrypoint] nginx started."
+        echo "[entrypoint] nginx started (port ${TTYD_PORT} SSL for ttyd, 443 for xray)."
     else
-        echo "[entrypoint] WARNING: nginx config test failed. Check ./data/nginx/ or open the web terminal to repair." >&2
+        echo "[entrypoint] WARNING: nginx config test failed:" >&2
+        nginx -t 2>&1 >&2 || true
+        echo "[entrypoint] Open the web terminal to repair nginx config." >&2
     fi
 
-    # Start xray only if both the binary and config are present
     if [[ -x "${XRAY_BIN}" && -f "${XRAY_CONF}" ]]; then
         mkdir -p /var/log/xray
         "${XRAY_BIN}" run -config "${XRAY_CONF}" >> /var/log/xray/xray.log 2>&1 &
         echo "[entrypoint] XRAY started (PID $!)."
     else
-        echo "[entrypoint] INFO: XRAY binary or config not found." >&2
-        echo "[entrypoint] INFO: Open the web terminal to run the setup wizard." >&2
+        echo "[entrypoint] INFO: XRAY binary or config not found — run setup wizard." >&2
+    fi
+else
+    # First run — no state file yet. nginx hasn't been configured by xray.sh.
+    # Start nginx anyway so the ttyd SSL block on TTYD_PORT is active.
+    # xray.sh will configure the main 443 block during the setup wizard.
+    if nginx -t 2>/dev/null; then
+        nginx
+        echo "[entrypoint] nginx started (ttyd SSL only — xray not yet configured)."
+    else
+        echo "[entrypoint] WARNING: nginx config test failed on first run:" >&2
+        nginx -t 2>&1 >&2 || true
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Launch ttyd
+# 7. Launch ttyd
 #
-# ttyd serves xray.sh as a browser-accessible terminal. The user opens
-# http://<server>:7681, authenticates, and sees the xray.sh wizard or
-# management menu directly. No SSH needed.
+# ttyd binds to 127.0.0.1:TTYD_INTERNAL_PORT (loopback, plain HTTP only).
+# nginx terminates TLS externally on TTYD_PORT and proxies here.
+# ttyd must NEVER bind to 0.0.0.0 — that would expose plain HTTP to the
+# internet with no TLS.
 #
-# When the user exits xray.sh (chooses "Exit" from the menu), ttyd shows
-# a "session closed, reconnect?" prompt. The next connection re-runs
-# xray.sh from scratch — no container restart needed.
-#
-# Environment variables (set via .env):
-#   TTYD_PORT        Port to listen on              (default: 7681)
-#   TTYD_CREDENTIAL  Basic auth as user:password    (default: unset = no auth)
+# Note: --writable is not supported in ttyd 1.7.3 (libwebsockets 4.3.2).
+# The flag was added in a later release. Do not add it back without first
+# verifying the ttyd version supports it.
 # ---------------------------------------------------------------------------
 TTYD_PORT="${TTYD_PORT:-7681}"
 
 ttyd_args=(
-    # Allow typing in the terminal (not read-only)
-    --writable
+    # Bind to loopback only — nginx handles external TLS on TTYD_PORT.
+    --interface 127.0.0.1
 
-    # Listen port
-    --port "${TTYD_PORT}"
-
-    # Reject a second browser connection while one session is active.
-    # This is an admin tool; concurrent sessions would fight over the same
-    # interactive prompts.
-    --max-clients 1
+    # Internal port (not exposed externally — nginx proxies TTYD_PORT here).
+    --port "${TTYD_INTERNAL_PORT}"
 
     # Browser tab title
     --client-option titleFixed="XRAY Setup"
 
-    # Suppress the "Leave site?" browser dialog — the session is stateless
-    # from the browser's perspective (state is in the container volumes).
+    # Suppress the "Leave site?" browser dialog.
     --client-option disableLeaveAlert=true
 
-    # Canvas renderer is more compatible than WebGL on headless/remote browsers
+    # Canvas renderer for headless/remote browser compatibility.
     --client-option rendererType=canvas
 )
 
-# Basic auth — strongly recommended when the port is internet-facing
 if [[ -n "${TTYD_CREDENTIAL:-}" ]]; then
     ttyd_args+=(--credential "${TTYD_CREDENTIAL}")
     echo "[entrypoint] ttyd basic auth enabled (user: ${TTYD_CREDENTIAL%%:*})"
@@ -160,9 +228,7 @@ else
     echo "[entrypoint] ============================================================" >&2
 fi
 
-echo "[entrypoint] Starting ttyd on port ${TTYD_PORT}..."
-echo "[entrypoint] Browser terminal: http://<this-server-ip>:${TTYD_PORT}"
+echo "[entrypoint] Starting ttyd on 127.0.0.1:${TTYD_INTERNAL_PORT} (loopback only)..."
+echo "[entrypoint] Browser terminal: https://<this-server-ip>:${TTYD_PORT}"
 
-# exec replaces this shell process — ttyd becomes PID 1 and receives
-# Docker's stop signal (SIGTERM by default) directly.
 exec ttyd "${ttyd_args[@]}" bash /opt/xray/xray.sh
