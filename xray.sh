@@ -93,6 +93,10 @@ svc_start() {
         systemctl start "${name}"
     else
         service "${name}" start 2>/dev/null || _svc_direct_start "${name}"
+        # In some container environments `service` exits 0 without actually
+        # starting the process (no init daemon to register with). Verify the
+        # process is running and fall back to direct invocation if it is not.
+        pgrep -x "${name}" > /dev/null 2>&1 || _svc_direct_start "${name}"
     fi
 }
 
@@ -103,6 +107,9 @@ svc_restart() {
         systemctl restart "${name}"
     else
         service "${name}" restart 2>/dev/null || _svc_direct_start "${name}"
+        # Same silent-success guard as svc_start: verify the process is actually
+        # running after the `service` call and force-start directly if not.
+        pgrep -x "${name}" > /dev/null 2>&1 || _svc_direct_start "${name}"
     fi
 }
 
@@ -110,7 +117,14 @@ svc_restart() {
 svc_reload() {
     local name="$1"
     if _has_systemd; then
-        systemctl reload "${name}"
+        # `systemctl reload` requires the service to already be active.
+        # If it is not running (e.g. first start during install, or a crash),
+        # fall back to `start` so the caller never needs to know the difference.
+        if systemctl is-active "${name}" > /dev/null 2>&1; then
+            systemctl reload "${name}"
+        else
+            systemctl start "${name}"
+        fi
     else
         case "${name}" in
             # nginx -s reload sends SIGHUP to the master process — works
@@ -1459,10 +1473,22 @@ Proceed?" || return 1
 #   3. Extract the xray binary to /usr/local/bin/xray
 #   4. Extract geoip.dat and geosite.dat to /usr/local/share/xray/
 #   5. Set permissions
+#   6. Write a systemd unit file on bare-metal/VM hosts (skipped in Docker)
 #
-# The systemd service unit is intentionally NOT created. In Docker the
-# entrypoint manages xray directly; on bare-metal/VM the svc_* wrappers
-# fall back to _svc_direct_start which runs the binary as a background job.
+# Service management strategy — two paths, mutually exclusive:
+#
+#   Bare-metal / VM  (_has_systemd → true):
+#     A xray.service unit file is written to /etc/systemd/system/ and
+#     daemon-reload is called. All subsequent svc_* calls use systemctl.
+#     Without this unit file, `systemctl restart xray` would fail with
+#     "Unit xray.service not found."
+#
+#   Docker / LXC  (_has_systemd → false):
+#     /run/systemd/system does not exist because systemd is not PID 1.
+#     The unit file block is skipped entirely. svc_* wrappers fall back to
+#     `service NAME restart || _svc_direct_start NAME`, which runs the
+#     binary directly as a background job. Nothing in this file changes
+#     for Docker.
 install_xray_binary() {
     log "Installing XRAY binary from GitHub releases..."
 
@@ -1514,12 +1540,61 @@ with zipfile.ZipFile(sys.argv[1]) as z:
     done
 
     rm -rf "${_tmp_dir}"
+
+    # -- systemd service unit (bare-metal / VM only) ---------------------------
+    # _has_systemd checks for /run/systemd/system, a directory created by
+    # systemd itself at boot. It is never present in Docker containers where
+    # systemd is not PID 1, so this entire block is skipped in Docker.
+    #
+    # On bare-metal/VM hosts this unit file is required. Without it, every
+    # `systemctl restart xray` call (from svc_restart, mgmt menus, etc.)
+    # fails immediately with "Unit xray.service not found." because systemctl
+    # has no record of the service even though the binary is installed.
+    #
+    # svc_enable xray (called later in do_install) handles `systemctl enable`
+    # automatically once this unit file exists, giving boot persistence.
+    if _has_systemd; then
+        cat > /etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        log "xray.service unit installed and systemd daemon reloaded."
+    fi
+
     log "XRAY installation complete  ($(${XRAY_BIN} version 2>/dev/null | head -1 || echo 'version unknown'))"
 }
 
 # remove_xray_binary — reverses install_xray_binary
 remove_xray_binary() {
     pkill -x xray 2>/dev/null || true
+
+    # -- systemd unit cleanup (bare-metal / VM only) ---------------------------
+    # Mirror of the install block: only runs when systemd is present.
+    # Removes the unit file written by install_xray_binary so that uninstall
+    # leaves no ghost service entry in systemctl. No-op in Docker because
+    # _has_systemd returns false and the file was never written there.
+    if _has_systemd && [[ -f /etc/systemd/system/xray.service ]]; then
+        systemctl disable xray 2>/dev/null || true
+        rm -f /etc/systemd/system/xray.service
+        systemctl daemon-reload
+        log "xray.service unit removed and systemd daemon reloaded."
+    fi
+
     rm -f  "${XRAY_BIN}"
     rm -rf "${XRAY_DAT_DIR}"
     rm -rf /usr/local/etc/xray
@@ -1532,10 +1607,10 @@ remove_xray_binary() {
 install_base_deps() {
     log "Updating package lists..."
     $PKG_MGR update -qq -y
-    log "Installing packages: nginx, certbot, jq, uuid-runtime, qrencode, psmisc..."
+    log "Installing packages: nginx, certbot, jq, uuid-runtime, qrencode, psmisc, openssl..."
     $PKG_MGR install -y -qq \
         nginx certbot \
-        curl uuid-runtime python3 jq qrencode psmisc
+        curl uuid-runtime python3 jq qrencode psmisc openssl
     # apt post-install may have tried to start nginx and failed, or started
     # another web server (apache2). Stop and disable apache2 if present so
     # it does not hold ports 80/443 when we start nginx.
@@ -1591,7 +1666,15 @@ do_install() {
     log "Starting installation  (mode: ${SETUP_MODE})..."
 
     # ── Free ports before nginx starts ────────────────────────────────────────
-    svc_stop nginx  2>/dev/null || true
+    # Bare metal: stop nginx so the new config can bind 80/443.
+    # Docker: entrypoint nginx serves ttyd on port 7681 ONLY — not 80 or 443
+    #   on a fresh install.  Stopping it kills the user's active browser
+    #   terminal session and frees nothing useful.  clear_port below handles
+    #   any non-nginx process that might be on 80/443.  nginx will be updated
+    #   in-place with `nginx -s reload` after the new site config is written.
+    if _has_systemd; then
+        svc_stop nginx 2>/dev/null || true
+    fi
     svc_stop apache2 2>/dev/null || true
     if [[ "${SETUP_MODE}" == "reverse_proxy" ]]; then
         clear_port "${LISTEN_PORT}"
@@ -1618,11 +1701,34 @@ do_install() {
     rm -f "${NGINX_SITES_ENABLED}/default" 2>/dev/null || true
     mkdir -p "${WEBROOT}"
 
+    # ── ttyd: cert + nginx block — done before nginx starts in any mode ───────
     if [[ "${SETUP_MODE}" == "reverse_proxy" ]]; then
         # ── Reverse proxy install path: no certbot ────────────────────────────
         log "Writing Nginx config (plain HTTP on port ${LISTEN_PORT})..."
         write_nginx_config_rp; nginx -t
-        svc_enable nginx; svc_restart nginx
+        svc_enable nginx
+
+        # Load the RP config into nginx.
+        #
+        # Bare metal: svc_stop already stopped nginx; start fresh.
+        # Docker: nginx is still running (svc_stop was skipped); reload picks
+        #   up the new site config and adds LISTEN_PORT without disrupting
+        #   the ttyd proxy on 7681.
+        if _has_systemd; then
+            log "Starting nginx on port ${LISTEN_PORT} (RP mode)..."
+            systemctl start nginx
+        else
+            log "Reloading nginx to activate RP config on port ${LISTEN_PORT}..."
+            nginx -s reload
+            sleep 2   # let workers finish binding before we verify
+        fi
+
+        if ! ss -tlnH "sport = :${LISTEN_PORT}" 2>/dev/null | grep -q .; then
+            die "nginx is not listening on port ${LISTEN_PORT} after config load.
+  Errors:  cat /var/log/nginx/error.log
+  Config:  nginx -t"
+        fi
+        log "nginx is up on port ${LISTEN_PORT}."
 
         log "Installing XRAY..."
         install_xray_binary
@@ -1680,13 +1786,39 @@ EOF
             ln -sf "${NGINX_SITES_AVAIL}/${DOMAIN}" "${NGINX_SITES_ENABLED}/${DOMAIN}"
             nginx -t
             svc_enable nginx
-            svc_start nginx
+
+            # Load the ACME HTTP-01 config into nginx.
+            #
+            # Bare metal: svc_stop already stopped nginx; start fresh.
+            # Docker: nginx is still running (svc_stop was skipped to preserve
+            #   the ttyd proxy).  Hot-reload picks up the new site config and
+            #   adds a port-80 listener without touching existing connections.
+            if _has_systemd; then
+                log "Starting nginx on port 80 for ACME challenge..."
+                systemctl start nginx
+            else
+                log "Reloading nginx to activate ACME config on port 80..."
+                nginx -s reload
+                sleep 2   # let workers finish binding before we verify
+            fi
+
+            if ! ss -tlnH 'sport = :80' 2>/dev/null | grep -q .; then
+                die "nginx is not listening on port 80 after config load.
+  Errors:  cat /var/log/nginx/error.log
+  Config:  nginx -t"
+            fi
+            log "nginx is up on port 80."
 
             # Verify port 80 is externally reachable before certbot runs.
-            # Set SKIP_PORT_CHECK=true to bypass (use when running in Docker
-            # or behind a NAT that does not support hairpin loopback).
+            # Skipped automatically in Docker/LXC (no systemd = no hairpin NAT —
+            # the container cannot curl its own external IP, so the check always
+            # fails even when port 80 is genuinely reachable from the internet).
+            # Also skipped when SKIP_PORT_CHECK=true is set explicitly.
             if [[ "${SKIP_PORT_CHECK:-false}" == "true" ]]; then
                 warn "SKIP_PORT_CHECK=true — skipping external port-80 check."
+                warn "Ensure port 80 on ${DOMAIN} is publicly reachable before certbot runs."
+            elif ! _has_systemd; then
+                warn "Docker/container detected — skipping hairpin port-80 check."
                 warn "Ensure port 80 on ${DOMAIN} is publicly reachable before certbot runs."
             else
                 log "Verifying port 80 is reachable from the internet..."
@@ -1731,7 +1863,31 @@ EOF
         write_nginx_config
         nginx -t
         svc_enable nginx
-        svc_restart nginx
+
+        # Activate the TLS config.
+        # At this point nginx is alive (it was started for the ACME phase and
+        # the port-80 check confirmed it).  Hot-reload preserves the listening
+        # socket so the transition is seamless; fall back to a fresh start if
+        # reload fails for any reason.
+        if _has_systemd; then
+            log "Restarting nginx with TLS config..."
+            systemctl restart nginx
+        else
+            log "Reloading nginx to activate TLS config..."
+            nginx -s reload 2>/dev/null || {
+                # Reload failed — remove stale pid file and start fresh
+                rm -f /run/nginx.pid 2>/dev/null || true
+                nginx
+            }
+            sleep 2   # let workers finish binding on port 443
+        fi
+
+        if ! ss -tlnH "sport = :${SERVER_PORT}" 2>/dev/null | grep -q .; then
+            die "nginx is not listening on port ${SERVER_PORT} after TLS config load.
+  Errors:  cat /var/log/nginx/error.log
+  Config:  nginx -t"
+        fi
+        log "nginx is up on port ${SERVER_PORT}."
 
         # certbot systemd timer for auto-renewal (systemd only, no-op in containers)
         if _has_systemd; then
@@ -3041,6 +3197,7 @@ menu_manage() {
 # =============================================================================
 # SECTION 25: Entry point
 # =============================================================================
+
 main() {
     require_root
     detect_os
@@ -3089,4 +3246,4 @@ will be kept. The decoy site will be regenerated." \
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi
