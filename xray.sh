@@ -197,6 +197,13 @@ _svc_direct_start() {
     esac
 }
 
+# =============================================================================
+# SECTION 3c: Docker detection
+# =============================================================================
+# Returns 0 (true) when running inside a Docker container.
+# /.dockerenv is created by Docker on container start and is the most reliable
+# single indicator available without external tooling.
+_in_docker() { [[ -f /.dockerenv ]]; }
 
 # =============================================================================
 # SECTION 3d: DNS-01 certificate helpers
@@ -839,6 +846,7 @@ LISTEN_PORT="${LISTEN_PORT}"
 ACME_METHOD="${ACME_METHOD}"
 DNS_PROVIDER="${DNS_PROVIDER}"
 DNS_CREDS_FILE="${DNS_CREDS_FILE}"
+STEALTH_MODE="${STEALTH_MODE:-false}"
 INSTALL_DATE="$(date -Iseconds)"
 EOF
     chmod 600 "${STATE_FILE}"
@@ -2414,6 +2422,118 @@ Nginx is still running. Remove if no longer needed:
 }
 
 # =============================================================================
+# SECTION 19b: Server management — stealth mode
+# =============================================================================
+# Stealth mode removes the nginx listener on the ttyd admin terminal port
+# (default 7681) so no browser-accessible service is visible on that port
+# while the proxy is in production use. The ttyd process keeps running on
+# 127.0.0.1:7682 (loopback); nginx simply stops forwarding external traffic
+# to it. Re-enabling recreates the nginx server block from known constants.
+#
+# State is written to STATE_FILE (a mounted volume) so it persists across
+# container restarts. entrypoint.sh reads STEALTH_MODE on startup and skips
+# writing the nginx ttyd block when it is "true".
+#
+# On bare metal: ttyd is not present and port 7681 is never exposed.
+# The menu option is always shown; selecting it displays an informational
+# message and makes no changes — consistent with how mgmt_renew_cert behaves
+# in reverse proxy mode.
+mgmt_stealth_toggle() {
+    if ! _in_docker; then
+        wt_msg "Stealth Mode — Not Applicable" \
+"This feature controls the ttyd admin terminal port (default 7681).
+
+Stealth mode applies only to the Docker deployment where port 7681
+is published to the host. On bare metal there is no ttyd process
+and no port 7681 is exposed.
+
+No changes were made."
+        return 0
+    fi
+
+    # These values mirror the constants in entrypoint.sh.
+    local _ttyd_nginx_conf="/etc/nginx/conf.d/xray-ttyd.conf"
+    local _ttyd_internal_port="7682"
+    local _ttyd_cert="/etc/ttyd/cert.pem"
+    local _ttyd_key="/etc/ttyd/key.pem"
+    local _ttyd_port="${TTYD_PORT:-7681}"
+
+    if [[ "${STEALTH_MODE:-false}" == "true" ]]; then
+        # Currently in stealth mode — offer to re-enable the port.
+        wt_yesno "Stealth Mode — Currently ON" \
+"The admin terminal port ${_ttyd_port} is currently closed.
+
+Re-enable it to access the configuration interface from a browser.
+After re-enabling, connect to:
+  https://<server-ip>:${_ttyd_port}
+
+Re-enable port ${_ttyd_port} now?" || return 0
+
+        # Recreate the nginx ttyd server block (matches entrypoint.sh template).
+        cat > "${_ttyd_nginx_conf}" <<NGINXEOF
+# ttyd web terminal — managed by xray.sh stealth mode. Do not edit by hand.
+# SSL only on port ${_ttyd_port}. Plain HTTP has no listener on this port.
+server {
+    listen      ${_ttyd_port} ssl;
+    listen      [::]:${_ttyd_port} ssl;
+
+    ssl_certificate     ${_ttyd_cert};
+    ssl_certificate_key ${_ttyd_key};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    location / {
+        proxy_pass         http://127.0.0.1:${_ttyd_internal_port};
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    \$http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+NGINXEOF
+        svc_reload nginx
+        STEALTH_MODE="false"
+        save_state
+        wt_msg "Stealth Mode Disabled" \
+"Port ${_ttyd_port} is now open.
+
+Admin terminal: https://<server-ip>:${_ttyd_port}
+
+Remember to re-enable stealth mode when configuration is complete."
+    else
+        # Currently accessible — offer to enable stealth mode.
+        wt_yesno "Stealth Mode — Currently OFF" \
+"Enable stealth mode to close the admin terminal port ${_ttyd_port}.
+
+While active:
+  - Port ${_ttyd_port} will not accept connections from outside
+  - The ttyd process keeps running on loopback only
+  - nginx will not forward external traffic to it
+  - All proxy functions on port 443 continue normally
+
+To re-configure later, return here and select Stealth Mode
+to re-open the port.
+
+Enable stealth mode now?" || return 0
+
+        rm -f "${_ttyd_nginx_conf}"
+        svc_reload nginx
+        STEALTH_MODE="true"
+        save_state
+        wt_msg "Stealth Mode Enabled" \
+"Port ${_ttyd_port} is now closed.
+
+The admin terminal is no longer reachable from outside.
+All proxy functions on port 443 continue normally.
+
+To re-enable, return to the management menu and
+select Stealth Mode again."
+    fi
+}
+
+# =============================================================================
 # SECTION 20: Client guide — wiki / how it all works
 # =============================================================================
 # These screens are shown when the user asks "how does this work?" or before
@@ -3169,6 +3289,20 @@ menu_manage() {
     load_state
     while true; do
         local xray_st; xray_st=$(svc_is_active xray && echo "active" || echo "inactive")
+
+        # Build the stealth menu label dynamically so it reflects current state.
+        local _stealth_label
+        if _in_docker; then
+            local _ttyd_port="${TTYD_PORT:-7681}"
+            if [[ "${STEALTH_MODE:-false}" == "true" ]]; then
+                _stealth_label="Stealth Mode        [ON]  re-open port ${_ttyd_port} terminal"
+            else
+                _stealth_label="Stealth Mode        [OFF] close port ${_ttyd_port} terminal"
+            fi
+        else
+            _stealth_label="Stealth Mode        (Docker only)"
+        fi
+
         local choice
         choice=$(wt_menu "XRAY Manager  —  ${DOMAIN}" \
             "Server: ${xray_st}  |  Path: ${WS_PATH}" \
@@ -3178,16 +3312,18 @@ menu_manage() {
             "branding"  "Branding            company name, tagline, color" \
             "status"    "Status              services, cert, config paths" \
             "renew"     "Renew TLS           force-renew the certificate" \
+            "stealth"   "${_stealth_label}" \
             "uninstall" "Uninstall           remove everything" \
             "exit"      "Exit") || break
 
         case "${choice}" in
-            device)    client_guide_menu ;;
-            clients)   mgmt_clients      ;;
-            path)      mgmt_change_path  ;;
-            branding)  mgmt_branding     ;;
-            status)    mgmt_status       ;;
-            renew)     mgmt_renew_cert   ;;
+            device)    client_guide_menu      ;;
+            clients)   mgmt_clients           ;;
+            path)      mgmt_change_path       ;;
+            branding)  mgmt_branding          ;;
+            status)    mgmt_status            ;;
+            renew)     mgmt_renew_cert        ;;
+            stealth)   mgmt_stealth_toggle    ;;
             uninstall) mgmt_uninstall; is_installed || break ;;
             exit)      break ;;
         esac

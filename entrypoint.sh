@@ -122,10 +122,26 @@ fi
 #
 # ttyd itself runs on 127.0.0.1:TTYD_INTERNAL_PORT (plain HTTP, loopback).
 # This block is the only way to reach it externally, and only over HTTPS.
+#
+# Skipped when stealth mode is active (STEALTH_MODE="true" in state.env).
+# In that case the port stays closed after container restart, matching the
+# state the user set from the management menu.
 # ---------------------------------------------------------------------------
 TTYD_NGINX_CONF="/etc/nginx/conf.d/xray-ttyd.conf"
-echo "[entrypoint] Writing nginx SSL block for ttyd on port ${TTYD_PORT}..."
-cat > "${TTYD_NGINX_CONF}" <<NGINXEOF
+
+_stealth_active=false
+if grep -q 'STEALTH_MODE="true"' "${STATE_FILE}" 2>/dev/null; then
+    _stealth_active=true
+fi
+
+if [[ "${_stealth_active}" == "true" ]]; then
+    echo "[entrypoint] Stealth mode is active — nginx ttyd block on port ${TTYD_PORT} will not be written."
+    # Remove any leftover conf from a previous non-stealth start so nginx
+    # does not accidentally re-open the port after a container restart.
+    rm -f "${TTYD_NGINX_CONF}"
+else
+    echo "[entrypoint] Writing nginx SSL block for ttyd on port ${TTYD_PORT}..."
+    cat > "${TTYD_NGINX_CONF}" <<NGINXEOF
 # ttyd web terminal — managed by entrypoint.sh. Do not edit by hand.
 # SSL only on port ${TTYD_PORT}. Plain HTTP has no listener on this port.
 server {
@@ -148,7 +164,8 @@ server {
     }
 }
 NGINXEOF
-echo "[entrypoint] nginx ttyd SSL block written: ${TTYD_NGINX_CONF}"
+    echo "[entrypoint] nginx ttyd SSL block written: ${TTYD_NGINX_CONF}"
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Re-start nginx and xray if a previous installation exists
