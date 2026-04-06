@@ -15,13 +15,13 @@ Generate your own website, certificate, and tunnel all your traffic through it.
 
 The xray.sh script will work inside of docker or on the host machine itself (Docker recommended).
 
+Requires ports 80 and 443 open, and a DNS A record pointing at the server.
 
 * * *
 
 ### Docker
 
 ```bash
-cp .env.example .env
 # Edit .env — and set TTYD_CREDENTIAL=user:password
 docker compose up -d
 ```
@@ -39,23 +39,23 @@ Open `http://<your-server-ip>:7681` in a browser. Enter the `TTYD_CREDENTIAL` yo
 sudo bash xray.sh
 ```
 
-Requires root, ports 80 and 443 open, and a DNS A record pointing at the server.
+Requires root.
 
 
 * * *
 
-## Which to Pick — Standalone vs Docker
+### Which to Pick — Standalone vs Docker
 
 Both modes run the same `xray.sh` script and produce identical configurations; the difference is environment.
 
-- **Standalone** installs nginx, certbot, and XRAY directly onto the host OS. Suitable for a dedicated VPS.
+- `Standalone` - installs nginx, certbot, and XRAY directly onto the host OS. Suitable for a dedicated VPS.
 
-- **Docker** wraps everything in a Debian 12 container. [ttyd](https://github.com/tsl0922/ttyd) serves the xray.sh wizard as a browser-accessible terminal on port 7681 — no SSH needed for setup or ongoing management. All data is written to `./data/` on the host, so the container can be recreated, upgraded, or moved to another server without losing configuration, certificates, or client UUIDs.
+- `Docker` - wraps everything in a Debian 12 container. [ttyd](https://github.com/tsl0922/ttyd) serves the xray.sh wizard as a browser-accessible terminal on port 7681 secured with basic auth — no SSH needed for setup or ongoing management. All data is written to `./data/` on the host, so the container can be recreated, upgraded, or moved to another server without losing configuration, certificates, or client UUIDs.
 
 
 * * *
 
-## Decoy Website
+## Your Decoy Homepage
 
 `xray.sh` generates a static HTML tech-company landing page. 
 
@@ -64,40 +64,20 @@ Both modes run the same `xray.sh` script and produce identical configurations; t
 - Company name, tagline, and accent color are configurable.
 
 
-* * * 
-
-## The Concept and How it Works
-
-Here is an overview of what we're doing:
-
-```
-Client (VLESS+WS+TLS)
-      |
-   port 443
-      |
-   Nginx  ──>  /           generic tech-company website
-          ──>  /<ws-path>  XRAY WebSocket proxy endpoint
-                    |
-                  XRAY
-                    |
-                internet
-```
-
-> The ISP sees: TLS to a real domain on port 443. The WS path and all traffic content are encrypted. A plain browser visit shows a convincing company landing page.
-
-
 * * *
 
-## Where is my website
+### Where is my data stored
 
-Everything xray.sh writes is stored under `./data/` on the host.
 
-The container can be stopped, upgraded, or moved without losing your configuration.
+#### Docker
+
+The docker-compose file keeps everything xray.sh writes stored under `./data/` on the host.
 
 ```
 ./data/
 ├── xray-setup/           # xray.sh state: domain, ports, WS path, client UUIDs
 │   ├── state.env
+│   ├── proxy_users.json  # HTTP proxy user accounts (if enabled)
 │   └── client1.txt
 ├── letsencrypt/          # TLS certificates (Let's Encrypt)
 ├── xray-config/          # XRAY config.json
@@ -113,6 +93,77 @@ The container can be stopped, upgraded, or moved without losing your configurati
 
 * * *
 
+#### Standalone (bare metal / VM)
+
+When run directly on the host, xray.sh writes to `standard system paths`. 
+
+Nothing is bundled under a single directory — files land where their respective services expect them.
+
+```
+/etc/xray-setup/
+├── state.env             # all install variables (domain, ports, WS path, mode)
+├── client1.txt           # first client's vless:// link  (chmod 600)
+├── proxy_users.json      # HTTP proxy user accounts, if enabled  (chmod 600)
+└── dns_credentials.ini   # DNS-01 provider API key, if used  (chmod 600)
+
+/usr/local/bin/xray                      # XRAY binary
+/usr/local/etc/xray/config.json          # XRAY runtime config
+/usr/local/share/xray/
+├── geoip.dat                            # IP geolocation data
+└── geosite.dat                          # domain category data
+
+/etc/systemd/system/xray.service         # systemd unit (bare metal only)
+
+/etc/nginx/sites-available/<domain>      # nginx site config written by xray.sh
+/etc/nginx/sites-enabled/<domain>        # symlink to the above
+
+/var/www/<domain>/                       # decoy website HTML root 
+                                         # (PAC file also served from here if - HTTP proxy is enabled)
+
+/etc/letsencrypt/live/<domain>/
+├── fullchain.pem                        # TLS certificate chain
+└── privkey.pem                          # private key
+
+/etc/letsencrypt/renewal-hooks/deploy/
+└── xray-reload.sh                       # auto-reload hook: nginx + XRAY
+                                         # reload after every cert renewal
+
+/var/log/nginx/                          # nginx access and error logs
+/var/log/xray/xray.log                   # XRAY log (non-systemd only;
+                                         # on systemd use: journalctl -u xray)
+/var/log/letsencrypt/letsencrypt.log     # certbot log
+```
+
+
+* * *
+
+## HTTP CONNECT Browser Proxy
+
+In addition to the VLESS tunnel, xray.sh can enable a browser proxy — no client app required on any device.
+
+When enabled, XRAY adds an HTTP CONNECT inbound and serves a [PAC file](https://developer.mozilla.org/en-US/docs/Web/HTTP/Proxy_servers_and_tunneling/Proxy_Auto-Configuration_PAC_file) at a randomised deep path (e.g. `https://domain.com/something/numbersandsuch/otherthing/proxy.pac`). Browsers load the PAC URL once and route all traffic through the proxy automatically.
+
+- **Multi-user** — each user gets their own username and password; accounts are added or revoked independently.
+- **Port 443 only** — browsers always connect over the existing HTTPS port; no extra firewall rules.
+- **PAC path rotation** — the hidden PAC URL can be regenerated at any time from the management menu.
+- **Mutual exclusion** — the HTTP proxy and VLESS tunnel cannot run simultaneously. Switching between them is a one-step toggle; proxy users are preserved when VLESS is re-enabled.
+
+> HTTP proxy is available in standalone mode only. Reverse proxy mode does not support it.
+
+
+* * *
+
+## Multi-Client Management
+
+Each device gets its own UUID and its own `vless://` link, or username and password with `HTTP CONNECT PROXY`. Clients are managed from within the script's menu without restarting the proxy.
+
+- **Add** — enter a label (e.g. `phone`, `alice`, `work-laptop`); a UUID is generated automatically - or for HTTP CONNECT PROXY a `username` and `password` is prompted.
+- **Remove** — select one or more clients to revoke; access is cut off the moment XRAY restarts. The last remaining client cannot be removed.
+- **List** — prints each client's full `vless://` link, or username and password to the terminal one at a time for copying.
+
+
+* * *
+
 ## Docker Ports
 
 | Port | Service | Purpose |
@@ -124,12 +175,43 @@ The container can be stopped, upgraded, or moved without losing your configurati
 
 * * *
 
-## Environment Variables (`.env`)
+## Environment Variables (.env)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TTYD_CREDENTIAL` | unset | Basic auth as `user:password`. **Set this.** An unset value leaves the terminal open to anyone who can reach port 7681. |
 | `TTYD_PORT` | `7681` | Port the browser terminal listens on |
+
+
+* * *
+
+## Stealth Mode (Docker only)
+
+In Docker mode, the management UI (ttyd) runs on a separate port (default 7681). Stealth mode closes that port to outside connections while leaving the proxy on port 443 fully operational.
+
+- **ON** — the ttyd nginx vhost is removed; port 7681 accepts no external connections.
+- **OFF** — the ttyd nginx vhost is restored; the browser terminal is accessible again.
+
+Toggle from **Manage → Stealth Mode**. Re-enable to regain access for future configuration.
+
+
+* * *
+
+## Management Menu Reference
+
+Once installed, re-running `xray.sh` detects the existing setup and opens the management menu. A reinstall option is also available — it replaces all client UUIDs and regenerates the decoy site while keeping the existing TLS certificate.
+
+| Menu item | What it does |
+|-----------|-------------|
+| Connect a Device | Opens the per-platform client guide |
+| Clients | Add, remove, or list client links |
+| Path | Rotate the hidden WebSocket path |
+| HTTP Proxy | Enable/disable browser proxy; manage users and PAC path |
+| Branding | Change company name, tagline, or accent color |
+| Status | Show service status, cert expiry, and config paths |
+| Renew TLS | Force-renew the Let's Encrypt certificate |
+| Stealth Mode | Toggle the admin terminal port (Docker only) |
+| Uninstall | Remove XRAY, nginx config, certificates, and state |
 
 
 * * *

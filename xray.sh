@@ -27,6 +27,7 @@ set -euo pipefail
 # =============================================================================
 readonly STATE_DIR="/etc/xray-setup"
 readonly STATE_FILE="${STATE_DIR}/state.env"
+readonly PROXY_USERS_FILE="${STATE_DIR}/proxy_users.json"
 readonly XRAY_CONF="/usr/local/etc/xray/config.json"
 readonly XRAY_BIN="/usr/local/bin/xray"
 # XRAY releases — downloaded directly; the official installer requires systemd
@@ -824,6 +825,19 @@ GUIDE_PORT=""    # effective port  clients connect to
 ACME_METHOD="http01" # "http01" = webroot (default) | "dns01" = DNS challenge
 DNS_PROVIDER=""      # cloudflare | digitalocean | route53 | linode | hetzner | ovh | manual
 DNS_CREDS_FILE=""    # path to provider credentials .ini (empty for route53/manual)
+# ── HTTP CONNECT browser proxy ────────────────────────────────────────────────
+# Standalone mode only. XRAY owns port 443 (TLS terminator); the HTTP CONNECT
+# proxy inbound receives traffic already decrypted via XRAY's fallback mechanism.
+# Disabled by default; enable from Manage → HTTP Proxy.
+HTTP_PROXY_ENABLED="false"
+HTTP_PROXY_PORT="8443"
+# Port nginx listens on for internal (decoy site) traffic coming from XRAY fallback.
+# TLS is terminated by XRAY before reaching here — plain HTTP only.
+NGINX_INTERNAL_PORT="8080"
+# Path under WEBROOT where the PAC file is written and served.
+# Generated once at enable-time: api/<8-hex>/<word>/proxy.pac
+# Kept deliberately deep and random so it cannot be discovered by crawlers.
+HTTP_PROXY_PAC_PATH=""
 
 is_installed() { [[ -f "${STATE_FILE}" ]]; }
 
@@ -847,6 +861,10 @@ ACME_METHOD="${ACME_METHOD}"
 DNS_PROVIDER="${DNS_PROVIDER}"
 DNS_CREDS_FILE="${DNS_CREDS_FILE}"
 STEALTH_MODE="${STEALTH_MODE:-false}"
+HTTP_PROXY_ENABLED="${HTTP_PROXY_ENABLED:-false}"
+HTTP_PROXY_PORT="${HTTP_PROXY_PORT:-8443}"
+HTTP_PROXY_PAC_PATH="${HTTP_PROXY_PAC_PATH:-}"
+NGINX_INTERNAL_PORT="${NGINX_INTERNAL_PORT:-8080}"
 INSTALL_DATE="$(date -Iseconds)"
 EOF
     chmod 600 "${STATE_FILE}"
@@ -971,35 +989,169 @@ HTMLEOF
 FIRST_UUID=""   # set as side-effect on fresh install
 
 write_xray_config() {
-    # $1 (optional) — pre-built JSON array of client objects
+    # $1 (optional) — pre-built JSON array of VLESS client objects.
+    #                  Ignored when HTTP_PROXY_ENABLED=true (no VLESS inbound).
     local clients_json="${1:-}"
 
-    if [[ -z "${clients_json}" ]]; then
-        FIRST_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
-        clients_json=$(jq -n \
-            --arg id    "${FIRST_UUID}" \
-            --arg email "client@${DOMAIN}" \
-            '[{"id": $id, "level": 0, "email": $email}]')
+    # ── HTTP proxy mode and VLESS mode are MUTUALLY EXCLUSIVE ──────────────────
+    # HTTP proxy mode  (HTTP_PROXY_ENABLED=true):
+    #   inbounds[0] — HTTP CONNECT proxy on 127.0.0.1:HTTP_PROXY_PORT (no TLS)
+    #   inbounds[1] — VLESS+TCP+TLS frontend, single default fallback → [0]
+    #   No VLESS WS inbound.  VLESS client management is disabled.
+    #
+    # VLESS mode  (HTTP_PROXY_ENABLED=false, default):
+    #   inbounds[0] — VLESS+WS on 127.0.0.1:XRAY_INTERNAL_PORT (no TLS)
+    #   inbounds[1] — VLESS+TCP+TLS frontend, WS-path fallback + nginx default
+    #   No HTTP proxy inbound.  All jq '.inbounds[0]...' client-mgmt refs work.
+
+    local inbounds_json
+    if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+        # ── HTTP PROXY MODE ────────────────────────────────────────────────────
+        # inbounds[0]: HTTP CONNECT proxy — no TLS (outer TLS frontend handles it)
+        # Receives CONNECT requests (authenticated tunneling) and any other traffic
+        # not matched by explicit path fallbacks in the TLS frontend.
+        # allowTransparent:true makes XRAY forward non-CONNECT, unauthenticated
+        # GET requests transparently to domain:80 (nginx) rather than returning 407.
+        # This handles the decoy site and any paths not explicitly listed as fallbacks.
+        local proxy_accounts; proxy_accounts=$(_proxy_users_load)
+        local http_inbound
+        http_inbound=$(jq -n \
+            --argjson hport    "${HTTP_PROXY_PORT}" \
+            --argjson accounts "${proxy_accounts}" \
+            '{
+              "port": $hport, "listen": "127.0.0.1",
+              "protocol": "http",
+              "settings": {
+                "accounts": $accounts,
+                "allowTransparent": true
+              },
+              "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
+            }') || die "write_xray_config: failed to build HTTP proxy inbound."
+
+        # inbounds[1]: VLESS+TCP+TLS on 0.0.0.0:SERVER_PORT
+        #
+        # XRAY fallback path matching is EXACT (not prefix).  path:"/" only
+        # matches the literal root request, NOT /api/.../proxy.pac.
+        # The reliable approach: write the exact PAC path as a fallback so XRAY
+        # routes it directly to nginx (200), bypassing the proxy inbound entirely.
+        #
+        # Traffic flow:
+        #   GET /api/.../proxy.pac → exact path match → nginx → 200 (PAC file)
+        #   CONNECT host:port      → no path match    → HTTP proxy → auth → tunnel
+        #   GET /anything/else     → no path match    → HTTP proxy → allowTransparent
+        #                                              → forwarded to domain:80 → nginx
+        local pac_fallback_path="/${HTTP_PROXY_PAC_PATH}"
+        local tls_frontend
+        tls_frontend=$(jq -n \
+            --argjson port    "${SERVER_PORT}" \
+            --arg     pacpath "${pac_fallback_path}" \
+            --argjson ngport  "${NGINX_INTERNAL_PORT:-8080}" \
+            --argjson hpport  "${HTTP_PROXY_PORT}" \
+            --arg     cert    "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" \
+            --arg     key     "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" \
+            '{
+              "port": $port, "listen": "0.0.0.0",
+              "protocol": "vless",
+              "settings": {
+                "clients": [],
+                "decryption": "none",
+                "fallbacks": [
+                  {"path": $pacpath, "dest": $ngport},
+                  {"dest": $hpport}
+                ]
+              },
+              "streamSettings": {
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                  "alpn": ["http/1.1"],
+                  "certificates": [{"certificateFile": $cert, "keyFile": $key}]
+                }
+              }
+            }') || die "write_xray_config: failed to build TLS frontend (proxy mode)."
+
+        inbounds_json=$(jq -n \
+            --argjson h "${http_inbound}" \
+            --argjson t "${tls_frontend}" \
+            '[$h, $t]') || die "write_xray_config: failed to assemble inbounds (proxy mode)."
+    else
+        # ── VLESS MODE (default) ───────────────────────────────────────────────
+        # inbounds[0]: VLESS+WS on 127.0.0.1:XRAY_INTERNAL_PORT
+        # Always index 0 — every jq '.inbounds[0]...' client-management
+        # reference in this script is safe as long as VLESS mode is active.
+        if [[ -z "${clients_json}" ]]; then
+            FIRST_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+            clients_json=$(jq -n \
+                --arg id    "${FIRST_UUID}" \
+                --arg email "client@${DOMAIN}" \
+                '[{"id": $id, "level": 0, "email": $email}]')
+        fi
+
+        local vless_inbound
+        vless_inbound=$(jq -n \
+            --argjson clients "${clients_json}" \
+            --arg     path    "${WS_PATH}" \
+            --argjson port    "${XRAY_INTERNAL_PORT}" \
+            '{
+              "port": $port, "listen": "127.0.0.1",
+              "protocol": "vless",
+              "settings": {"clients": $clients, "decryption": "none"},
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": $path}
+              }
+            }') || die "write_xray_config: failed to build VLESS WS inbound."
+
+        # inbounds[1]: VLESS+TCP+TLS on 0.0.0.0:SERVER_PORT
+        # Fallbacks: WS path → VLESS WS inbound; default → nginx decoy.
+        local fallbacks_json
+        fallbacks_json=$(jq -n \
+            --arg    wspath  "${WS_PATH}" \
+            --argjson wsport "${XRAY_INTERNAL_PORT}" \
+            --argjson ngport "${NGINX_INTERNAL_PORT:-8080}" \
+            '[
+              {"path": $wspath, "dest": $wsport},
+              {"dest": $ngport}
+            ]') || die "write_xray_config: failed to build fallbacks (VLESS mode)."
+
+        local tls_frontend
+        tls_frontend=$(jq -n \
+            --argjson port      "${SERVER_PORT}" \
+            --argjson fallbacks "${fallbacks_json}" \
+            --arg     cert      "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" \
+            --arg     key       "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" \
+            '{
+              "port": $port, "listen": "0.0.0.0",
+              "protocol": "vless",
+              "settings": {
+                "clients": [],
+                "decryption": "none",
+                "fallbacks": $fallbacks
+              },
+              "streamSettings": {
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                  "alpn": ["http/1.1"],
+                  "certificates": [{"certificateFile": $cert, "keyFile": $key}]
+                }
+              }
+            }') || die "write_xray_config: failed to build TLS frontend (VLESS mode)."
+
+        inbounds_json=$(jq -n \
+            --argjson v "${vless_inbound}" \
+            --argjson t "${tls_frontend}" \
+            '[$v, $t]') || die "write_xray_config: failed to assemble inbounds (VLESS mode)."
     fi
 
     mkdir -p "$(dirname "${XRAY_CONF}")"
     # Write to a temp file first so a jq failure never leaves a 0-byte config.
     local _tmp; _tmp=$(mktemp)
     jq -n \
-        --argjson clients "${clients_json}" \
-        --arg     path    "${WS_PATH}" \
-        --argjson port    "${XRAY_INTERNAL_PORT}" \
+        --argjson inbounds "${inbounds_json}" \
         '{
           "log": {"loglevel": "warning"},
-          "inbounds": [{
-            "port": $port, "listen": "127.0.0.1",
-            "protocol": "vless",
-            "settings": {"clients": $clients, "decryption": "none"},
-            "streamSettings": {
-              "network": "ws",
-              "wsSettings": {"path": $path}
-            }
-          }],
+          "inbounds": $inbounds,
           "outbounds": [
             {"protocol": "freedom",   "settings": {}, "tag": "direct"},
             {"protocol": "blackhole", "settings": {}, "tag": "blocked"}
@@ -1018,77 +1170,66 @@ write_xray_config() {
 # =============================================================================
 # SECTION 10: Nginx config writer
 # =============================================================================
+# In standalone mode XRAY terminates TLS on SERVER_PORT (443).  Nginx is no
+# longer the public HTTPS server; instead it:
+#   • Listens on port 80 for ACME http-01 challenges and HTTP→HTTPS redirects.
+#   • Listens on 127.0.0.1:NGINX_INTERNAL_PORT for the decoy site, PAC file,
+#     and static assets served to browsers via XRAY's "/" fallback.
+# TLS certificates and the WS proxy location have been removed — XRAY owns both.
 write_nginx_config() {
-    local cert_path="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-    local key_path="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-    local chain_path="/etc/letsencrypt/live/${DOMAIN}/chain.pem"
     local conf="${NGINX_SITES_AVAIL}/${DOMAIN}"
-
-    # nginx < 1.25.1 : http2 is a parameter on the listen directive
-    # nginx >= 1.25.1: listen...http2 was deprecated; use standalone "http2 on;"
-    # nginx >= 1.27.x: listen...http2 was removed entirely — causes fatal error
-    local _ver _maj _min
-    _ver=$(nginx -v 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "1.18.0")
-    _maj=$(cut -d. -f1 <<< "${_ver}")
-    _min=$(cut -d. -f2 <<< "${_ver}")
-    local h2_listen=" http2" h2_directive=""
-    if [[ "${_maj}" -gt 1 ]] || { [[ "${_maj}" -eq 1 ]] && [[ "${_min}" -ge 25 ]]; }; then
-        h2_listen=""
-        h2_directive="http2 on;"  # heredoc indents this 4 spaces; no leading spaces here
-    fi
 
     cat > "${conf}" <<NGINXEOF
 # Managed by xray.sh — do not edit by hand.
+# TLS is terminated by XRAY on port ${SERVER_PORT}; nginx serves only:
+#   port 80         — ACME http-01 challenge + decoy site
+#   127.0.0.1:${NGINX_INTERNAL_PORT} — same decoy site on internal port
+#
+# Port 80 DOES NOT redirect to HTTPS.  XRAY's HTTP CONNECT proxy inbound uses
+# allowTransparent:true, which forwards non-CONNECT requests transparently to
+# domain:80.  If port 80 redirected to HTTPS, that connection would loop back
+# through XRAY and create an infinite redirect.  Serving the decoy site on both
+# HTTP and HTTPS is correct — the decoy is public content by design.
 
+# ── Public HTTP: ACME challenge + decoy site ─────────────────────────────────
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen ${SERVER_PORT} ssl${h2_listen};
-    listen [::]:${SERVER_PORT} ssl${h2_listen};
-    ${h2_directive}
-    server_name ${DOMAIN};
-
-    ssl_certificate        ${cert_path};
-    ssl_certificate_key    ${key_path};
-    ssl_protocols          TLSv1.2 TLSv1.3;
-    ssl_ciphers            ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache      shared:SSL:10m;
-    ssl_session_timeout    1d;
-    ssl_stapling           on;
-    ssl_stapling_verify    on;
-    ssl_trusted_certificate ${chain_path};
-    resolver               1.1.1.1 8.8.8.8 valid=300s;
-    resolver_timeout       5s;
-    add_header             Strict-Transport-Security "max-age=63072000" always;
 
     root  ${WEBROOT};
     index index.html;
 
-    # Decoy: any browser visitor sees a convincing product site.
     location / {
         try_files \$uri \$uri/ =404;
     }
 
-    # XRAY WebSocket endpoint.
-    # A plain HTTP GET to this path returns 400 — not an error page,
-    # so it does not hint that anything special is running here.
-    location ${WS_PATH} {
-        if (\$http_upgrade != "websocket") { return 400; }
-        proxy_pass          http://127.0.0.1:${XRAY_INTERNAL_PORT};
-        proxy_http_version  1.1;
-        proxy_set_header    Upgrade         \$http_upgrade;
-        proxy_set_header    Connection      "upgrade";
-        proxy_set_header    Host            \$host;
-        proxy_set_header    X-Real-IP       \$remote_addr;
-        proxy_set_header    X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout  86400s;
-        proxy_send_timeout  86400s;
+    # Correct MIME type for PAC files — some browsers reject the file without it.
+    location ~* \.pac$ {
+        default_type application/x-ns-proxy-autoconfig;
+    }
+}
+
+# ── Internal HTTP: decoy site (TLS already terminated by XRAY) ───────────────
+# Receives traffic from XRAY's fallback path="/"; plain HTTP on loopback only.
+server {
+    listen 127.0.0.1:${NGINX_INTERNAL_PORT};
+    server_name ${DOMAIN};
+
+    # HSTS is valid here: the browser receives this header over the TLS
+    # connection established with XRAY — nginx's plain-HTTP hop is internal.
+    add_header Strict-Transport-Security "max-age=63072000" always;
+
+    root  ${WEBROOT};
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    # Correct MIME type for PAC files — some browsers reject the file without it.
+    location ~* \.pac$ {
+        default_type application/x-ns-proxy-autoconfig;
     }
 }
 NGINXEOF
@@ -1136,6 +1277,10 @@ server {
         proxy_set_header    X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_read_timeout  86400s;
         proxy_send_timeout  86400s;
+    }
+
+    location ~* \.pac$ {
+        default_type application/x-ns-proxy-autoconfig;
     }
 }
 NGINXEOF
@@ -1856,6 +2001,9 @@ EOF
                 || die "Certificate not found after certbot. Check DNS and that port 80 is reachable."
         fi
 
+        # Write certbot deploy hook so nginx and XRAY both reload after renewal.
+        write_certbot_deploy_hook
+
         log "Installing XRAY..."
         install_xray_binary
 
@@ -1866,36 +2014,39 @@ EOF
         log "Generating decoy website..."
         generate_decoy_site
 
-        # Write the full TLS nginx config now that the certificate exists.
-        log "Writing final Nginx config (TLS)..."
+        # Write PAC file if HTTP proxy was previously enabled (e.g. reinstall).
+        write_pac_file
+
+        # Write the final nginx config.
+        # In standalone mode nginx no longer serves TLS — XRAY owns port 443.
+        # Nginx serves port 80 (ACME + redirect) and the internal decoy site.
+        log "Writing final Nginx config..."
         write_nginx_config
         nginx -t
         svc_enable nginx
 
-        # Activate the TLS config.
-        # At this point nginx is alive (it was started for the ACME phase and
-        # the port-80 check confirmed it).  Hot-reload preserves the listening
-        # socket so the transition is seamless; fall back to a fresh start if
-        # reload fails for any reason.
+        # Reload nginx to pick up the new config.
+        # At this point nginx is alive (started for the ACME phase).
+        # Hot-reload preserves the port-80 socket; fall back to a fresh start
+        # if reload fails for any reason.
         if _has_systemd; then
-            log "Restarting nginx with TLS config..."
+            log "Restarting nginx..."
             systemctl restart nginx
         else
-            log "Reloading nginx to activate TLS config..."
+            log "Reloading nginx..."
             nginx -s reload 2>/dev/null || {
-                # Reload failed — remove stale pid file and start fresh
                 rm -f /run/nginx.pid 2>/dev/null || true
                 nginx
             }
-            sleep 2   # let workers finish binding on port 443
+            sleep 1
         fi
 
-        if ! ss -tlnH "sport = :${SERVER_PORT}" 2>/dev/null | grep -q .; then
-            die "nginx is not listening on port ${SERVER_PORT} after TLS config load.
+        if ! ss -tlnH 'sport = :80' 2>/dev/null | grep -q .; then
+            die "nginx is not listening on port 80 after config load.
   Errors:  cat /var/log/nginx/error.log
   Config:  nginx -t"
         fi
-        log "nginx is up on port ${SERVER_PORT}."
+        log "nginx is up on port 80."
 
         # certbot systemd timer for auto-renewal (systemd only, no-op in containers)
         if _has_systemd; then
@@ -1915,6 +2066,16 @@ EOF
   systemd:     journalctl -u xray -n 50
   non-systemd: ${XRAY_BIN} run -config ${XRAY_CONF}"
     svc_is_active nginx || die "Nginx not running. Check: journalctl -u nginx -n 50"
+
+    # In standalone mode XRAY now owns SERVER_PORT (443) — verify it bound.
+    if [[ "${SETUP_MODE}" == "standalone" ]]; then
+        if ! ss -tlnH "sport = :${SERVER_PORT}" 2>/dev/null | grep -q .; then
+            die "XRAY is not listening on port ${SERVER_PORT}.
+  Validate config: ${XRAY_BIN} run -test -config ${XRAY_CONF}
+  Check logs:      journalctl -u xray -n 50"
+        fi
+        log "XRAY is up on port ${SERVER_PORT}."
+    fi
 
     save_state
 
@@ -1962,10 +2123,11 @@ your first device — phone, laptop, or anything else."
     print_link "Client 1  —  client@${DOMAIN}" "${first_link}"
 
     wt_msg "What's Next: Connecting a Device" \
-"The server is running. Now you need a client app on the
-device you want to route through it.
+"The server is running. You have two ways to use it:
 
-The next section is a built-in guide covering every platform:
+── VLESS client apps (current mode) ──────────────────
+Requires a small app on each device. The next section
+is a built-in guide covering every platform:
 
   - Linux  (config generator — paste your link, get config.json)
   - Clash Verge  (GUI for Linux, Windows, macOS — YAML generator)
@@ -1973,6 +2135,13 @@ The next section is a built-in guide covering every platform:
   - macOS  (Clash Verge, V2Box, Hiddify)
   - Android  (v2rayNG — full walkthrough + QR scan)
   - iOS  (Shadowrocket, V2Box, Hiddify)
+
+── HTTP browser proxy (zero-install alternative) ─────
+Any browser can use this server as an HTTPS proxy — no
+app install required. Configure once via a PAC URL and
+the browser routes all traffic through this server.
+
+  Enable from:  Main menu  ->  HTTP Proxy
 
 You can return to this guide at any time from:
   Main menu  ->  Connect a Device"
@@ -1983,7 +2152,24 @@ You can return to this guide at any time from:
 # =============================================================================
 # SECTION 14: Server management — clients
 # =============================================================================
+# Guard: VLESS client management is unavailable while HTTP proxy mode is active.
+# Call at the top of every function that touches VLESS clients or WS config.
+_require_vless_mode() {
+    if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+        wt_msg "Not Available in HTTP Proxy Mode" \
+"VLESS client management is disabled while the browser HTTP proxy is active.
+
+The HTTP proxy and VLESS are mutually exclusive — only one can run at a time.
+
+To manage VLESS clients, disable the HTTP proxy first:
+  Manage → HTTP Proxy → Disable"
+        return 1
+    fi
+    return 0
+}
+
 mgmt_client_list() {
+    _require_vless_mode || return 0
     if [[ ! -f "${XRAY_CONF}" ]]; then
         wt_msg "Error" "XRAY config not found at ${XRAY_CONF}.\nRun a fresh install first."
         return 1
@@ -2025,6 +2211,7 @@ You can also generate a QR code from the client guide:
 }
 
 mgmt_client_add() {
+    _require_vless_mode || return 0
     local label
     label=$(wt_input "Add Client — Label" \
         "Enter a label for this client.\n\nThis is for your reference only — not visible in TLS traffic.\nExamples:  phone  alice  work-laptop  tablet" \
@@ -2062,6 +2249,7 @@ Use the client guide to share it with a device:
 }
 
 mgmt_client_remove() {
+    _require_vless_mode || return 0
     local clients_json count
     clients_json=$(jq '.inbounds[0].settings.clients' "${XRAY_CONF}")
     count=$(echo "${clients_json}" | jq 'length')
@@ -2126,6 +2314,7 @@ mgmt_clients() {
 # SECTION 15: Server management — change WebSocket path
 # =============================================================================
 mgmt_change_path() {
+    _require_vless_mode || return 0
     local rand_ver rand_hex suggest
     rand_ver=$(shuf -i 1-4 -n 1)
     rand_hex=$(tr -d '-' < /proc/sys/kernel/random/uuid | head -c 8)
@@ -2266,7 +2455,11 @@ mgmt_status() {
 
     xray_st=$(svc_is_active xray  && echo "active" || echo "inactive")
     nginx_st=$(svc_is_active nginx && echo "active" || echo "inactive")
-    client_count=$(jq '.inbounds[0].settings.clients | length' "${XRAY_CONF}" 2>/dev/null || echo "?")
+    if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+        client_count="N/A (HTTP proxy mode)"
+    else
+        client_count=$(jq '.inbounds[0].settings.clients | length' "${XRAY_CONF}" 2>/dev/null || echo "?")
+    fi
 
     if [[ "${SETUP_MODE}" == "reverse_proxy" ]]; then
         wt_msg "Server Status — Reverse Proxy Mode" \
@@ -2302,6 +2495,14 @@ Logs (run in terminal)
             cert_expiry="certificate not found"
         fi
 
+        local _proxy_status
+        if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+            local _pu_count; _pu_count=$(_proxy_users_count 2>/dev/null || echo "?")
+            _proxy_status="enabled  (port 443  |  ${_pu_count} user(s))"
+        else
+            _proxy_status="disabled"
+        fi
+
         wt_msg "Server Status — Standalone" \
 "Services
   XRAY   : ${xray_st}
@@ -2314,7 +2515,13 @@ TLS Certificate
 XRAY
   Clients       : ${client_count}
   WS path       : ${WS_PATH}
-  Internal port : ${XRAY_INTERNAL_PORT}
+  TLS port      : ${SERVER_PORT}  (public — XRAY terminates TLS)
+  WS inbound    : 127.0.0.1:${XRAY_INTERNAL_PORT}  (internal)
+  Nginx decoy   : 127.0.0.1:${NGINX_INTERNAL_PORT:-8080}  (internal)
+
+HTTP Browser Proxy
+  Status  : ${_proxy_status}
+  PAC URL : https://${DOMAIN}/${HTTP_PROXY_PAC_PATH:-<not set>}
 
 Config paths
   XRAY   : ${XRAY_CONF}
@@ -2352,7 +2559,9 @@ Only force-renew if auto-renewal is not working." || return 0
     clear
     log "Running: certbot renew --force-renewal --cert-name ${DOMAIN}"
     certbot renew --force-renewal --cert-name "${DOMAIN}" || true
+    # In standalone mode XRAY terminates TLS and must re-read the renewed cert.
     svc_reload nginx
+    pkill -HUP xray 2>/dev/null || true
     wt_msg "Renewal Attempted" \
 "Check the terminal output above for results.
 
@@ -2400,6 +2609,9 @@ This cannot be undone." || return 0
     svc_reload nginx 2>/dev/null || true
 
     log "Removing web root..."; rm -rf "${WEBROOT}" 2>/dev/null || true
+
+    # HTTP_PROXY_PORT is 127.0.0.1-only — no ufw rule was ever opened for it.
+
     log "Removing state...";    rm -rf "${STATE_DIR}" 2>/dev/null || true
 
     if [[ "${SETUP_MODE}" == "reverse_proxy" ]]; then
@@ -2534,6 +2746,462 @@ select Stealth Mode again."
 }
 
 # =============================================================================
+# SECTION 19c: HTTP CONNECT browser proxy
+# =============================================================================
+# Adds a second XRAY inbound (protocol: http) on a dedicated port with TLS.
+# Browsers configure themselves via a PAC file served at a randomised deep
+# path — e.g. https://domain.com/api/3f8b19c2/config/proxy.pac
+# The path is generated once at enable-time and stored in state.
+#
+# Architecture:
+#   Browser → HTTPS → XRAY port 443 (TLS frontend, inbounds[1])
+#               ├── VLESS WS path   → XRAY WS inbound  (XRAY_INTERNAL_PORT)
+#               ├── regular HTTP /  → nginx internal    (NGINX_INTERNAL_PORT, decoy/PAC)
+#               └── CONNECT method  → XRAY HTTP inbound (HTTP_PROXY_PORT, internal)
+#                                          └── TCP tunnel → internet
+#
+# Standalone mode only: requires the Let's Encrypt cert that certbot manages.
+# RP mode cannot offer TLS on the proxy port and is gracefully declined.
+
+# _gen_pac_path — returns a randomised path like api/3f8b19c2/config/proxy.pac
+_gen_pac_path() {
+    local seg; seg=$(openssl rand -hex 4)
+    local -a _words=(config setup init connect access bootstrap sync assets)
+    local word="${_words[$((RANDOM % ${#_words[@]}))]}"
+    echo "api/${seg}/${word}/proxy.pac"
+}
+
+# _validate_proxy_port PORT — returns 0 if the port is usable, 1 if not.
+# Prints an error message on failure so callers can surface it.
+_validate_proxy_port() {
+    local p="$1"
+    if ! [[ "${p}" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
+        warn "Port must be a number between 1 and 65535."; return 1
+    fi
+    local reserved
+    for reserved in 80 443 "${SERVER_PORT}" "${XRAY_INTERNAL_PORT}" "${NGINX_INTERNAL_PORT:-8080}" "${TTYD_PORT:-7681}"; do
+        if [[ "${p}" == "${reserved}" ]]; then
+            warn "Port ${p} is already used by another service."; return 1
+        fi
+    done
+    return 0
+}
+
+# write_pac_file — writes the PAC file into WEBROOT at HTTP_PROXY_PAC_PATH.
+# No-op when HTTP_PROXY_ENABLED != true or SETUP_MODE != standalone.
+write_pac_file() {
+    [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]] || return 0
+    [[ "${SETUP_MODE}" == "standalone"           ]] || return 0
+    [[ -n "${WEBROOT}" && -n "${HTTP_PROXY_PAC_PATH}" ]] || return 0
+
+    local full_path="${WEBROOT}/${HTTP_PROXY_PAC_PATH}"
+    mkdir -p "$(dirname "${full_path}")"
+    # Port 443 is the HTTPS default — omit the port so the PAC string reads
+    # "HTTPS domain" rather than "HTTPS domain:443".  Both forms work but the
+    # shorter form is canonical and avoids confusion if SERVER_PORT ever changes.
+    cat > "${full_path}" <<PACEOF
+function FindProxyForURL(url, host) {
+    return "HTTPS ${DOMAIN}";
+}
+PACEOF
+    chmod 644 "${full_path}"
+}
+
+# =============================================================================
+# SECTION 18b: HTTP proxy — multi-user helpers
+# =============================================================================
+# Users are stored as a JSON array in PROXY_USERS_FILE:
+#   [{"user":"alice","pass":"abc123"},{"user":"bob","pass":"xyz789"}]
+# This file is separate from state.env to avoid shell quoting issues with JSON.
+
+_proxy_users_load() {
+    # Migrate legacy single-user vars to the JSON file on first access.
+    if [[ ! -f "${PROXY_USERS_FILE}" && -n "${HTTP_PROXY_USER:-}" ]]; then
+        local migrated
+        migrated=$(jq -n \
+            --arg u "${HTTP_PROXY_USER}" \
+            --arg p "${HTTP_PROXY_PASS}" \
+            '[{"user": $u, "pass": $p}]')
+        _proxy_users_save "${migrated}"
+        HTTP_PROXY_USER=""
+        HTTP_PROXY_PASS=""
+    fi
+    if [[ -f "${PROXY_USERS_FILE}" ]]; then
+        cat "${PROXY_USERS_FILE}"
+    else
+        echo "[]"
+    fi
+}
+
+_proxy_users_save() {
+    local json="$1"
+    mkdir -p "${STATE_DIR}"; chmod 700 "${STATE_DIR}"
+    echo "${json}" > "${PROXY_USERS_FILE}"
+    chmod 600 "${PROXY_USERS_FILE}"
+}
+
+_proxy_users_count() {
+    _proxy_users_load | jq 'length'
+}
+
+# =============================================================================
+# SECTION 18c: HTTP proxy — management menu (redesigned for multi-user)
+# =============================================================================
+mgmt_http_proxy() {
+    if [[ "${SETUP_MODE}" != "standalone" ]]; then
+        wt_msg "HTTP Proxy — Not Applicable" \
+"The browser HTTP CONNECT proxy requires a TLS certificate
+managed by this server (standalone mode).
+
+This installation runs in reverse proxy mode where TLS is
+handled upstream. The HTTP proxy feature is not available."
+        return 0
+    fi
+
+    while true; do
+        local _hdr _user_count
+        if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+            _user_count=$(_proxy_users_count)
+            _hdr="[ON]  port 443  |  ${_user_count} user(s)"
+        else
+            _hdr="[OFF]"
+        fi
+
+        local choice
+        if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+            choice=$(wt_menu "HTTP Proxy — ${_hdr}" \
+                "Zero-install browser proxy via PAC file. No plugin needed." \
+                "users"    "Users              add / remove / list credentials" \
+                "pac"      "PAC path           rotate the hidden PAC URL" \
+                "show"     "Show info          PAC URL + browser setup guide" \
+                "disable"  "Disable proxy      switch back to VLESS" \
+                "back"     "Back") || return 0
+        else
+            choice=$(wt_menu "HTTP Proxy — ${_hdr}" \
+                "Zero-install browser proxy via PAC file. No plugin needed." \
+                "enable"   "Enable proxy       set up HTTP CONNECT proxy" \
+                "back"     "Back") || return 0
+        fi
+
+        case "${choice}" in
+            users)   _mgmt_proxy_users_menu    ;;
+            pac)     _mgmt_proxy_change_pac_path ;;
+            show)    _mgmt_http_proxy_show     ;;
+            enable)  _mgmt_http_proxy_enable   ;;
+            disable) _mgmt_http_proxy_disable  ;;
+            back)    return 0 ;;
+        esac
+    done
+}
+
+_mgmt_http_proxy_enable() {
+    # Collect internal port
+    local new_port
+    new_port=$(wt_input "HTTP Proxy — Internal Port" \
+"Internal port XRAY uses for the HTTP CONNECT inbound.
+Bound to 127.0.0.1 only — NOT a public port.
+Browsers always connect through port 443.
+
+Default is 8443 — only change if there is a local conflict." \
+        "${HTTP_PROXY_PORT:-8443}") || return 0
+
+    if ! _validate_proxy_port "${new_port}"; then
+        wt_msg "Invalid Port" "Port ${new_port} cannot be used. Please try again."
+        return 0
+    fi
+
+    wt_yesno "HTTP Proxy — Confirm Enable" \
+"Enable HTTP CONNECT proxy?
+
+  Public port   : 443
+  Internal port : ${new_port}  (127.0.0.1 only)
+
+IMPORTANT: HTTP proxy and VLESS are mutually exclusive.
+Enabling this will DISABLE the VLESS tunnel.
+
+After enabling, add users from:
+  HTTP Proxy → Users → Add user" || return 0
+
+    HTTP_PROXY_PORT="${new_port}"
+    HTTP_PROXY_ENABLED="true"
+
+    [[ -z "${HTTP_PROXY_PAC_PATH}" ]] && HTTP_PROXY_PAC_PATH="$(_gen_pac_path)"
+
+    # If no users exist yet, prompt for the first one now.
+    local _count; _count=$(_proxy_users_count)
+    if [[ "${_count}" -eq 0 ]]; then
+        wt_msg "HTTP Proxy — First User" \
+"The proxy requires at least one user account.
+
+You will be prompted to create the first user now.
+More users can be added from HTTP Proxy → Users → Add user."
+        _mgmt_proxy_user_add || true
+    fi
+
+    save_state
+    write_xray_config
+    write_pac_file
+    svc_restart xray
+
+    wt_msg "HTTP Proxy Enabled" \
+"Browser proxy is now active on port 443.
+
+PAC URL:
+  https://${DOMAIN}/${HTTP_PROXY_PAC_PATH}
+
+Use HTTP Proxy → Show info for the browser setup guide.
+Use HTTP Proxy → Users to add more users."
+}
+
+_mgmt_http_proxy_disable() {
+    [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]] || {
+        wt_msg "HTTP Proxy" "The proxy is already disabled. No changes made."
+        return 0
+    }
+
+    wt_yesno "HTTP Proxy — Disable" \
+"Disable the browser HTTP CONNECT proxy?
+
+  The HTTP proxy inbound will be removed from XRAY config.
+  The PAC file will be deleted.
+  VLESS will be re-enabled on port 443 with a new client UUID.
+
+Proxy users are preserved — they will be restored if you
+re-enable the proxy later." || return 0
+
+    HTTP_PROXY_ENABLED="false"
+    save_state
+    write_xray_config
+
+    [[ -n "${HTTP_PROXY_PAC_PATH}" ]] && rm -f "${WEBROOT}/${HTTP_PROXY_PAC_PATH}" 2>/dev/null || true
+
+    svc_restart xray
+
+    wt_msg "HTTP Proxy Disabled" \
+"The browser proxy has been disabled.
+
+VLESS is now active on port 443 with a new client.
+Use Manage → Clients to view the new VLESS link."
+}
+
+_mgmt_http_proxy_show() {
+    if [[ "${HTTP_PROXY_ENABLED:-false}" != "true" ]]; then
+        wt_msg "HTTP Proxy — Off" \
+"The browser proxy is not currently enabled.
+
+Select 'Enable proxy' from the menu to set it up."
+        return 0
+    fi
+
+    local users; users=$(_proxy_users_load)
+    local user_list; user_list=$(echo "${users}" | jq -r '.[] | "  \(.user)  /  \(.pass)"')
+    local count; count=$(echo "${users}" | jq 'length')
+
+    wt_msg "HTTP Proxy — Active  (${count} user(s))" \
+"PAC URL:
+  https://${DOMAIN}/${HTTP_PROXY_PAC_PATH}
+
+Proxy host : ${DOMAIN}
+Proxy port : 443
+
+Users (username / password):
+${user_list}
+
+--- Browser setup ---
+
+Chrome / Edge / Brave:
+  Settings → System → Open proxy settings →
+  Automatic proxy configuration URL → paste PAC URL.
+  Auth prompt appears on first CONNECT request.
+
+Firefox:
+  PAC + auth is broken in Firefox (known bug).
+  Use manual proxy instead:
+  Settings → Network Settings → Manual proxy →
+    HTTPS Proxy: ${DOMAIN}   Port: 443
+  Firefox will prompt for username / password once.
+
+Safari / macOS system-wide:
+  System Settings → Network → Proxies →
+  Automatic Proxy Configuration → paste PAC URL."
+}
+
+# =============================================================================
+# SECTION 18d: HTTP proxy — user management
+# =============================================================================
+_mgmt_proxy_users_menu() {
+    while true; do
+        local _count; _count=$(_proxy_users_count)
+        local choice
+        choice=$(wt_menu "HTTP Proxy — Users  (${_count} active)" \
+            "Manage accounts that can authenticate with the proxy." \
+            "list"   "List users       show all usernames and passwords" \
+            "add"    "Add user         create a new proxy account" \
+            "remove" "Remove user      revoke a proxy account" \
+            "back"   "Back") || return 0
+        case "${choice}" in
+            list)   _mgmt_proxy_user_list   ;;
+            add)    _mgmt_proxy_user_add    ;;
+            remove) _mgmt_proxy_user_remove ;;
+            back)   return 0 ;;
+        esac
+    done
+}
+
+_mgmt_proxy_user_list() {
+    local users; users=$(_proxy_users_load)
+    local count; count=$(echo "${users}" | jq 'length')
+
+    if [[ "${count}" -eq 0 ]]; then
+        wt_msg "HTTP Proxy Users" \
+"No users configured.
+
+Add a user from HTTP Proxy → Users → Add user."
+        return 0
+    fi
+
+    local user_list; user_list=$(echo "${users}" | jq -r '.[] | "  \(.user)  /  \(.pass)"')
+    wt_msg "HTTP Proxy Users  (${count} active)" \
+"Username  /  Password
+${user_list}"
+}
+
+_mgmt_proxy_user_add() {
+    local new_user new_pass
+    new_user=$(wt_input "Add Proxy User — Username" \
+        "Username for proxy authentication:" "") || return 0
+    [[ -z "${new_user}" ]] && { wt_msg "Error" "Username cannot be empty."; return 0; }
+
+    # Check for duplicate
+    local users; users=$(_proxy_users_load)
+    local exists; exists=$(echo "${users}" | jq --arg u "${new_user}" 'any(.[]; .user == $u)')
+    if [[ "${exists}" == "true" ]]; then
+        wt_msg "Error" "A user named '${new_user}' already exists.\nUse Remove user first if you want to replace it."
+        return 0
+    fi
+
+    new_pass=$(wt_input "Add Proxy User — Password" \
+        "Password for '${new_user}':" "") || return 0
+    [[ -z "${new_pass}" ]] && { wt_msg "Error" "Password cannot be empty."; return 0; }
+
+    local updated
+    updated=$(echo "${users}" | jq \
+        --arg u "${new_user}" \
+        --arg p "${new_pass}" \
+        '. + [{"user": $u, "pass": $p}]')
+    _proxy_users_save "${updated}"
+
+    # Reload XRAY config only if proxy is currently active.
+    if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+        write_xray_config
+        svc_restart xray
+    fi
+
+    wt_msg "User Added" \
+"Proxy account created.
+
+  Username : ${new_user}
+  Password : ${new_pass}
+
+$(if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then echo "XRAY reloaded — the new account is active immediately."; else echo "The account will become active when the proxy is enabled."; fi)"
+}
+
+_mgmt_proxy_user_remove() {
+    local users; users=$(_proxy_users_load)
+    local count; count=$(echo "${users}" | jq 'length')
+
+    if [[ "${count}" -eq 0 ]]; then
+        wt_msg "No Users" "No proxy users to remove."
+        return 0
+    fi
+
+    # Build menu from user list
+    local items=() i=0
+    while read -r uname; do
+        items+=( "${uname}" "${uname}" )
+        (( i++ )) || true
+    done < <(echo "${users}" | jq -r '.[].user')
+    items+=( "back" "Cancel" )
+
+    local choice
+    choice=$(wt_menu "Remove Proxy User" \
+        "Select the user to remove:" \
+        "${items[@]}") || return 0
+    [[ "${choice}" == "back" ]] && return 0
+
+    if [[ "${count}" -eq 1 ]]; then
+        wt_msg "Cannot Remove" \
+"'${choice}' is the only proxy user and cannot be removed.
+
+Add a replacement user first, then remove this one."
+        return 0
+    fi
+
+    wt_yesno "Confirm Remove" "Remove proxy user '${choice}'?" || return 0
+
+    local updated
+    updated=$(echo "${users}" | jq --arg u "${choice}" '[.[] | select(.user != $u)]')
+    _proxy_users_save "${updated}"
+
+    if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+        write_xray_config
+        svc_restart xray
+    fi
+
+    wt_msg "User Removed" "'${choice}' has been removed.
+$(if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then echo "XRAY reloaded — the account is revoked immediately."; fi)"
+}
+
+_mgmt_proxy_change_pac_path() {
+    if [[ "${HTTP_PROXY_ENABLED:-false}" != "true" ]]; then
+        wt_msg "PAC Path" "Enable the proxy first before changing the PAC path."
+        return 0
+    fi
+
+    wt_yesno "Rotate PAC Path" \
+"Generate a new random PAC file path?
+
+  Current: https://${DOMAIN}/${HTTP_PROXY_PAC_PATH}
+
+The old URL will stop working immediately.
+Anyone using the old PAC URL will need the new one." || return 0
+
+    # Remove old PAC file
+    [[ -n "${HTTP_PROXY_PAC_PATH}" ]] && rm -f "${WEBROOT}/${HTTP_PROXY_PAC_PATH}" 2>/dev/null || true
+
+    HTTP_PROXY_PAC_PATH="$(_gen_pac_path)"
+    save_state
+    write_pac_file
+    write_xray_config   # bakes the new path into the XRAY fallback
+    svc_restart xray
+
+    wt_msg "PAC Path Rotated" \
+"New PAC URL:
+  https://${DOMAIN}/${HTTP_PROXY_PAC_PATH}
+
+Distribute the new URL to all proxy users.
+The old URL is no longer valid."
+}
+
+# write_certbot_deploy_hook — installs a deploy hook so nginx AND XRAY both
+# reload after certbot renews the certificate.  Idempotent.
+# Only meaningful on bare-metal systemd hosts; Docker uses the cron job in
+# the Dockerfile instead (which is extended separately).
+write_certbot_deploy_hook() {
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    mkdir -p "${hook_dir}"
+    cat > "${hook_dir}/xray-reload.sh" <<'HOOKEOF'
+#!/bin/sh
+# Reload nginx and send SIGHUP to XRAY after certbot renews the certificate.
+# XRAY re-reads TLS certificate paths from config.json on SIGHUP; since
+# Let's Encrypt symlinks are updated in-place this is sufficient.
+nginx -s reload 2>/dev/null || true
+pkill -HUP xray  2>/dev/null || true
+HOOKEOF
+    chmod 755 "${hook_dir}/xray-reload.sh"
+}
+
+# =============================================================================
 # SECTION 20: Client guide — wiki / how it all works
 # =============================================================================
 # These screens are shown when the user asks "how does this work?" or before
@@ -2658,6 +3326,7 @@ Options for routing:
 # SECTION 21: Client guide — QR code picker
 # =============================================================================
 guide_show_qr() {
+    _require_vless_mode || return 0
     # Let the user pick which client's QR to show
     local clients_json count
     clients_json=$(jq '.inbounds[0].settings.clients' "${XRAY_CONF}")
@@ -3237,6 +3906,60 @@ manage multiple servers from one profile URL."
 }
 
 # =============================================================================
+# SECTION 22b: Client guide — browser proxy explainer
+# =============================================================================
+guide_browser_proxy() {
+    wt_msg "Browser Proxy — How It Works" \
+"This server supports a zero-install browser proxy mode.
+
+Instead of installing an app, you point your browser at a
+PAC (Proxy Auto-Config) URL. The browser reads that file
+and automatically routes all its traffic through this server
+over HTTPS on port 443 — the same port as normal web traffic.
+
+From the outside it looks like regular HTTPS.  No app.  No plugin.
+Works in Chrome, Edge, Brave, Safari, and most system proxy settings.
+
+Firefox note: Firefox has a known bug where PAC + proxy auth
+does not work correctly.  Firefox users should configure a
+manual HTTPS proxy instead:
+  Settings → Network Settings → Manual proxy configuration
+  HTTPS Proxy: ${DOMAIN}   Port: 443"
+
+    if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+        local users; users=$(_proxy_users_load)
+        local count; count=$(echo "${users}" | jq 'length')
+        local user_list; user_list=$(echo "${users}" | jq -r '.[] | "  \(.user)  /  \(.pass)"')
+        wt_msg "Browser Proxy — Currently Active  (${count} user(s))" \
+"PAC URL:
+  https://${DOMAIN}/${HTTP_PROXY_PAC_PATH}
+
+Proxy host : ${DOMAIN}
+Proxy port : 443
+
+Users (username / password):
+${user_list}
+
+Browser setup:
+  Chrome/Edge/Brave  →  Settings → System → Open proxy settings
+                         Automatic proxy configuration URL → paste PAC URL
+  Safari/macOS       →  System Settings → Network → Proxies
+                         Automatic Proxy Configuration → paste PAC URL
+  Firefox            →  use manual proxy (see note above)"
+    else
+        wt_msg "Browser Proxy — Currently Disabled" \
+"The browser proxy is not enabled on this server.
+
+To enable it, go to:
+  Main menu  →  HTTP Proxy  →  Enable proxy
+
+Once enabled you can add multiple users, each with their
+own username and password.  Users can be added or revoked
+at any time without affecting other users."
+    fi
+}
+
+# =============================================================================
 # SECTION 23: Client guide — top-level menu
 # =============================================================================
 # This is the main entry point for anything client-facing.
@@ -3258,26 +3981,28 @@ client_guide_menu() {
         local choice
         choice=$(wt_menu "Connect a Device  —  ${DOMAIN}" \
             "Choose a topic or platform to get started:" \
-            "how"     "How it works         understand the system" \
-            "qr"      "Show QR Code         scan with phone (Android / iOS)" \
-            "linux"   "Linux                terminal setup + config generator" \
-            "clash"   "Clash Verge          GUI for Linux, Windows, macOS" \
-            "windows" "Windows              v2rayN or Hiddify" \
-            "macos"   "macOS                Clash Verge, V2Box, or Hiddify" \
-            "android" "Android              v2rayNG  (full walkthrough)" \
-            "ios"     "iOS                  Shadowrocket, V2Box, or Hiddify" \
-            "back"    "Back to main menu") || break
+            "how"        "How it works         understand the system" \
+            "browser"    "Browser proxy        zero-install — any browser, no app needed" \
+            "qr"         "Show QR Code         scan with phone (Android / iOS)" \
+            "linux"      "Linux                terminal setup + config generator" \
+            "clash"      "Clash Verge          GUI for Linux, Windows, macOS" \
+            "windows"    "Windows              v2rayN or Hiddify" \
+            "macos"      "macOS                Clash Verge, V2Box, or Hiddify" \
+            "android"    "Android              v2rayNG  (full walkthrough)" \
+            "ios"        "iOS                  Shadowrocket, V2Box, or Hiddify" \
+            "back"       "Back to main menu") || break
 
         case "${choice}" in
-            how)     guide_wiki       ;;
-            qr)      guide_show_qr   ;;
-            linux)   guide_linux     ;;
-            clash)   guide_clash_yaml ;;
-            windows) guide_windows   ;;
-            macos)   guide_macos     ;;
-            android) guide_android   ;;
-            ios)     guide_ios       ;;
-            back)    break           ;;
+            how)     guide_wiki            ;;
+            browser) guide_browser_proxy   ;;
+            qr)      guide_show_qr        ;;
+            linux)   guide_linux          ;;
+            clash)   guide_clash_yaml     ;;
+            windows) guide_windows        ;;
+            macos)   guide_macos          ;;
+            android) guide_android        ;;
+            ios)     guide_ios            ;;
+            back)    break                ;;
         esac
     done
 }
@@ -3303,23 +4028,34 @@ menu_manage() {
             _stealth_label="Stealth Mode        (Docker only)"
         fi
 
+        # Build the HTTP proxy menu label dynamically.
+        local _proxy_label
+        if [[ "${HTTP_PROXY_ENABLED:-false}" == "true" ]]; then
+            local _pl_count; _pl_count=$(_proxy_users_count 2>/dev/null || echo "?")
+            _proxy_label="HTTP Proxy          [ON]  port 443  |  ${_pl_count} user(s)"
+        else
+            _proxy_label="HTTP Proxy          [OFF] zero-install browser PAC proxy"
+        fi
+
         local choice
         choice=$(wt_menu "XRAY Manager  —  ${DOMAIN}" \
             "Server: ${xray_st}  |  Path: ${WS_PATH}" \
-            "device"    "Connect a Device    share access / client guide" \
-            "clients"   "Clients             add / remove / list links" \
-            "path"      "Path                change the hidden WebSocket path" \
-            "branding"  "Branding            company name, tagline, color" \
-            "status"    "Status              services, cert, config paths" \
-            "renew"     "Renew TLS           force-renew the certificate" \
-            "stealth"   "${_stealth_label}" \
-            "uninstall" "Uninstall           remove everything" \
-            "exit"      "Exit") || break
+            "device"     "Connect a Device    share access / client guide" \
+            "clients"    "Clients             add / remove / list links" \
+            "path"       "Path                change the hidden WebSocket path" \
+            "httpproxy"  "${_proxy_label}" \
+            "branding"   "Branding            company name, tagline, color" \
+            "status"     "Status              services, cert, config paths" \
+            "renew"      "Renew TLS           force-renew the certificate" \
+            "stealth"    "${_stealth_label}" \
+            "uninstall"  "Uninstall           remove everything" \
+            "exit"       "Exit") || break
 
         case "${choice}" in
             device)    client_guide_menu      ;;
             clients)   mgmt_clients           ;;
             path)      mgmt_change_path       ;;
+            httpproxy) mgmt_http_proxy        ;;
             branding)  mgmt_branding          ;;
             status)    mgmt_status            ;;
             renew)     mgmt_renew_cert        ;;

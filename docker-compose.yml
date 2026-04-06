@@ -5,13 +5,13 @@
 #   1. cp .env.example .env
 #   2. Edit .env  (at minimum: change TTYD_CREDENTIAL)
 #   3. docker compose up -d
-#   4. Open  https://<your-server-ip>:7681  in a browser (accept the self-signed cert)
+#   4. Open  https://<your-server-ip>:7681  in a browser (accept the self-signed cert warning)
 #   5. Follow the xray.sh wizard to complete setup
 #
 # Ports:
 #   7681  — ttyd web terminal  (your browser-based configuration UI)
 #   80    — nginx              (Let's Encrypt ACME challenge + HTTP redirect)
-#   443   — nginx / XRAY       (HTTPS + VLESS proxy endpoint)
+#   443   — XRAY               (TLS terminator: VLESS + HTTP CONNECT proxy on same port)
 #
 # All configuration, certificates, and generated files are written to
 # ./data/ on the host. The container can be stopped, upgraded, and moved
@@ -53,7 +53,7 @@ services:
     ports:
       - "7681:7681"   # ttyd admin terminal  (browser setup UI)
       - "80:80"       # nginx HTTP           (ACME challenge + redirect to HTTPS)
-      - "443:443"     # nginx HTTPS          (VLESS/WS/TLS endpoint)
+      - "443:443"     # nginx/XRAY HTTPS     (VLESS/WS/TLS + HTTP CONNECT proxy on same port)
 
     # -------------------------------------------------------------------------
     # Persistent volumes  —  everything that must survive container recreation

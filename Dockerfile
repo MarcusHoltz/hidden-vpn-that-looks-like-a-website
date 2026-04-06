@@ -88,7 +88,7 @@ RUN set -eux; \
 # Runs daily at 03:17 (staggered to avoid load spikes on Let's Encrypt).
 # The deploy-hook reloads nginx so the new cert is served immediately.
 # ---------------------------------------------------------------------------
-RUN echo "17 3 * * * root certbot renew --quiet --deploy-hook 'nginx -s reload'" \
+RUN echo "17 3 * * * root certbot renew --quiet --deploy-hook 'nginx -s reload && pkill -HUP xray || true'" \
         > /etc/cron.d/certbot-renew \
     && chmod 0644 /etc/cron.d/certbot-renew
 
@@ -112,7 +112,8 @@ RUN chmod +x /entrypoint.sh
 # ---------------------------------------------------------------------------
 RUN rm -f /etc/nginx/sites-enabled/default
 
-# Expose all user-facing ports
+# Expose all user-facing ports.
+# The HTTP CONNECT browser proxy shares port 443 with VLESS — no extra port needed.
 EXPOSE 7681 80 443
 
 ENTRYPOINT ["/entrypoint.sh"]
