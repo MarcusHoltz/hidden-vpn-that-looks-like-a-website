@@ -26,7 +26,7 @@ Requires ports 80 and 443 open, and a DNS A record pointing at the server.
 docker compose up -d
 ```
 
-Open `http://<your-server-ip>:7681` in a browser. Enter the `TTYD_CREDENTIAL` you used above.
+Open `https://<your-server-ip>:7681` in a browser (accept the self-signed cert warning). Enter the `TTYD_CREDENTIAL` you used above.
 
 > The xray.sh wizard runs directly in the browser terminal — no SSH required.
 
@@ -75,12 +75,12 @@ The docker-compose file keeps everything xray.sh writes stored under `./data/` o
 
 ```
 ./data/
-├── xray-setup/           # xray.sh state: domain, ports, WS path, client UUIDs
+├── xray-setup/           # xray.sh state: domain, ports, WS path, branding, mode
 │   ├── state.env
 │   ├── proxy_users.json  # HTTP proxy user accounts (if enabled)
-│   └── client1.txt
+│   └── client1.txt       # initial client's vless:// link (convenience copy)
 ├── letsencrypt/          # TLS certificates (Let's Encrypt)
-├── xray-config/          # XRAY config.json
+├── xray-config/          # XRAY config.json — includes all client UUIDs
 ├── nginx/
 │   ├── sites-available/  # nginx site configs written by xray.sh
 │   └── sites-enabled/
